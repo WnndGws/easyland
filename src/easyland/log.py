@@ -1,12 +1,11 @@
-import logging
+from loguru import logger
 
-logger = logging
-logger.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("easyland.log"),
-        logging.StreamHandler()
-    ]
+logger.remove()  # Remove default handler
+logger.add(
+    "easyland.log",
+    level="INFO",
+    rotation="10 MB",
+    retention="10 days",
+    compression="zip",
 )
-    
+logger.add(lambda msg: print(msg, end=""), level="INFO")
