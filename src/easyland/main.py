@@ -5,11 +5,8 @@ import sys
 import time
 from easyland.daemon import Daemon
 
-version = "0.7.6"
-
 
 def import_from_path(path):
-    # Use module name from path basename, replace hyphens with underscores
     module_name = path.rsplit("/", 1)[-1].replace("-", "_").removesuffix(".py")
     spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
@@ -29,16 +26,18 @@ def main():
     args = parser.parse_args()
 
     if args.version:
-        print(f"Easyland version: {version}")
+        print("Easyland version: 0.7.6")
         sys.exit(0)
 
     config = import_from_path(args.config)
     daemon = Daemon(config)
+    daemon.setup_tasks()
+
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        pass
+        print("Exiting...")
 
 
 if __name__ == "__main__":

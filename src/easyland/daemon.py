@@ -1,24 +1,29 @@
-import asyncio
+import os
 import json
 import sys
 import time
 import regex as re
+import subprocess
 from loguru import logger
 from easyland.idle import Idle
+from threading import Thread
 
 
 class Daemon:
     def __init__(self, config):
         self.config = config
         self.listeners = self.get_listeners()
+        logger.info("Starting easyland daemon")
+        self.threads = []
+        self.call_handler("init")
+
+    def setup_tasks(self):
         listener_names = self.listeners.keys()
 
-        logger.info("Starting easyland daemon")
-
-        self.tasks = []
-
         if "hyprland" in listener_names:
-            self.tasks.append(asyncio.create_task(self.launch_hyprland_daemon()))
+            t = Thread(target=self.launch_hyprland_daemon, daemon=True)
+            t.start()
+            self.threads.append(t)
 
         if "sway" in listener_names:
             if not "event_types" in self.listeners["sway"]:
@@ -42,18 +47,22 @@ class Daemon:
                 if event_type not in existing_types:
                     logger.error("Sway - Invalid event type: " + event_type)
                     sys.exit(1)
-                self.tasks.append(
-                    asyncio.create_task(self.launch_sway_daemon(event_type))
+                t = Thread(
+                    target=self.launch_sway_daemon, args=(event_type,), daemon=True
                 )
+                t.start()
+                self.threads.append(t)
 
         if "systemd_logind" in listener_names:
-            self.tasks.append(asyncio.create_task(self.launch_systemd_login_daemon()))
+            t = Thread(target=self.launch_systemd_login_daemon, daemon=True)
+            t.start()
+            self.threads.append(t)
 
         if "idle" in listener_names:
             if callable(getattr(self.config, "idle_config", None)):
-                self.tasks.append(asyncio.create_task(self.launch_idle_daemon()))
-
-        self.call_handler("init")
+                t = Thread(target=self.launch_idle_daemon, daemon=True)
+                t.start()
+                self.threads.append(t)
 
     def get_listeners(self):
         if hasattr(self.config, "listeners"):
@@ -67,50 +76,52 @@ class Daemon:
         if callable(func):
             func(*argv)
 
-    async def launch_idle_daemon(self):
+    def launch_idle_daemon(self):
         idle_config = self.config.idle_config()
         idle = Idle(idle_config)
         idle.setup()
 
-    async def launch_hyprland_daemon(self):
+    def launch_hyprland_daemon(self):
         logger.info("Launching hyprland daemon")
         socket = self.listeners["hyprland"].get(
             "socket_path",
             "$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock",
         )
+        socket = os.path.expandvars(socket)
+        logger.info(f"Using Hyprland socket path: {socket}")
         cmd = ["socat", "-U", "-", f"UNIX-CONNECT:{socket}"]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
 
         while True:
-            line = await proc.stdout.readline()
+            line = proc.stdout.readline()
             if not line:
-                err = (await proc.stderr.read()).decode()
+                err = proc.stderr.read()
                 logger.error(f"Error while listening to Hyprland socket: {err}")
                 sys.exit(1)
             self.last_event_time = time.time()
-            decoded_line = line.decode("utf-8").strip()
+            decoded_line = line.strip()
             logger.debug(decoded_line)
             if ">>" in decoded_line:
                 data = decoded_line.split(">>", 1)
                 self.call_handler("on_hyprland_event", data[0], data[1])
 
-    async def launch_sway_daemon(self, event_type):
+    def launch_sway_daemon(self, event_type):
         logger.info(f"Launching Sway daemon for event type: {event_type}")
         cmd = ["swaymsg", "-m", "-r", "-t", "subscribe", f'["{event_type}"]']
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
 
         while True:
-            line = await proc.stdout.readline()
+            line = proc.stdout.readline()
             if not line:
                 logger.error(
                     f"Sway daemon: subprocess ended unexpectedly for event type {event_type}"
                 )
                 return
-            decoded_line = line.decode("utf-8").strip()
+            decoded_line = line.strip()
             try:
                 json_output = json.loads(decoded_line)
                 self.call_handler(f"on_sway_event_{event_type}", json_output)
@@ -119,20 +130,20 @@ class Daemon:
                 logger.error("Sway daemon: Exiting")
                 return
 
-    async def launch_systemd_login_daemon(self):
+    def launch_systemd_login_daemon(self):
         logger.info("Launching systemd daemon")
         cmd = ["gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1"]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
 
         pattern = re.compile(r"(.+?): ([^\s]+?) \((.*?)\)$")
         while True:
-            line = await proc.stdout.readline()
+            line = proc.stdout.readline()
             if not line:
                 logger.error("Systemd daemon subprocess ended unexpectedly")
                 return
-            decoded_line = line.decode("utf-8").strip()
+            decoded_line = line.strip()
             res = pattern.match(decoded_line)
             if res:
                 sender, name, payload = res.groups()
@@ -141,27 +152,3 @@ class Daemon:
                     f = "on_" + signal_name
                     self.call_handler(f, payload)
                     self.call_handler("on_systemd_event", sender, signal_name, payload)
-
-
-async def main(config):
-    daemon = Daemon(config)
-    if daemon.tasks:
-        await asyncio.gather(*daemon.tasks)
-    else:
-        logger.warning("No daemon tasks to run.")
-
-
-if __name__ == "__main__":
-    import typer
-
-    app = typer.Typer()
-
-    @app.command()
-    def run(config_module: str):
-        # Dynamically import config module by name
-        import importlib
-
-        config = importlib.import_module(config_module)
-        asyncio.run(main(config))
-
-    app()
